@@ -7,7 +7,9 @@
 可预约首次投递时刻，也可为排队等待设置截止期限。每个目标端点还带有**自动熔断器**：
 连续 3 次投递失败即熔断 10 秒，到期后仅放行队头事件作为唯一 half-open 探针。
 此外可为任意目标设置**维护开关**（`PUT /targets/pause`）：暂停后不再领取该目标的
-新事件、其他目标照常投递，恢复时不重置任何退避/熔断/尝试状态。
+新事件、其他目标照常投递，恢复时不重置任何退避/熔断/尝试状态。还可为任意目标设置
+**投递限速**（`PUT /targets/pace`）：同一目标两次领取之间至少间隔指定秒数，
+首次投递与重试都占用间隔，只阻挡该目标队头，其他目标照常投递。
 技术栈：**Python · FastAPI · SQLite**。
 
 ## 特性
@@ -21,6 +23,7 @@
 - **按目标端点的自动熔断器**：同一目标**连续 3 次**投递失败（非 2xx、超时、连接错误）后进入 **open**，10 秒内该目标的任何事件都不会被领取；熔断到期**且队头事件已到原定投递时间**（退避/`deliver_after`）时，只允许该队头事件作为唯一的 **half-open 探针**领取，其余事件继续排队。探针返回 2xx → 熔断 **closed**、连续失败计数清零；探针失败 → 重新 open 10 秒（计数继续累计）。熔断**只影响出问题的目标**，其他端点照常并行投递。状态（`closed`/`open`/`half-open`）、连续失败数、截止时间与探针事件 id 全部持久化在 SQLite，**重启后继续生效**，并与队头顺序、1/2/4 退避、过期清扫和死信重放完全兼容。
 - **熔断器查询**：`GET /targets/breakers` 返回每个有过投递尝试的目标的当前状态、`consecutive_failures`、open 截止时间（`open_until`，RFC 3339 UTC）与 half-open 探针事件 id（`probe_event_id`），支持按 `state` / `target` 过滤。
 - **目标维护开关**：`PUT /targets/pause`（请求体 `{"target": <URL>, "paused": <bool>}`）按与入站事件**相同的目标 URL 规范化**精确匹配目标，重复设置幂等；`GET /targets/pauses` 返回所有已设置目标及其暂停状态。暂停后调度器**不再领取**该目标的新事件，**已领取（`processing`）的在途请求正常完成**，**其他目标照常投递**；暂停期间排队事件**仍按 `expires_at` 正常清扫过期**。恢复只解除暂停：队头顺序、预约时间、1/2/4 退避与熔断（open 截止时间、失败计数、half-open 探针）一律保持，**不重置尝试次数或熔断状态**。开关写入与调度领取在同一把数据库锁的串行事务中生效，状态保存在 SQLite `target_pauses` 表，**重启后保留**，老库启动自动建表。
+- **按目标投递限速**：`PUT /targets/pace`（请求体 `{"target": <URL>, "interval_seconds": <0～3600>}`）为单个目标设置**两次领取的最小间隔**（秒），`0` 表示关闭；`GET /targets/paces` 返回所有已配置目标及其上次领取时刻、下一可领取时刻。每次领取——**首次投递、退避重试、half-open 探针**——都占用一个间隔：该目标的队头事件只有在「上次领取时刻 + 间隔」到期后才会被领取，**只阻挡该目标队头**，其他目标照常并行投递。调整间隔后按**上次领取时刻**重算下一可领取时刻（不重置历史），设为 `0` **立即解除**。限速与 `deliver_after` 预约、1/2/4 退避、熔断、暂停**叠加生效**（全部条件满足才放行），**过期清扫不受限速影响**。配置写入与调度领取在同一把数据库锁的串行事务中生效，配置与上次领取时刻保存在 SQLite `target_paces` 表，**重启后保留**，老库启动自动建表。
 - **死信重放**：`POST /events/{event_id}/replay` 仅接受 `dead` 事件，在一个事务内将其重新入队并开启**新一轮完整**的 1s/2s/4s 退避（再次享有 4 次尝试）。历史 `attempts` 全部保留、`attempt_no` 连续递增，`replay_count` 累计并记录 `last_replayed_at`，幂等键与事件 id 不变；并发重复重放只会生效一次，不会重复投递。
 - **事件查询**：返回每次尝试的时间、HTTP 响应码/错误信息、最终状态（`queued` / `processing` / `delivered` / `dead` / `expired`），时间窗字段 `deliver_after` / `expires_at`，以及 `replay_count` / `last_replayed_at` 重放信息。
 - **崩溃恢复**：投递状态全部在 SQLite（WAL 模式）中，重启后把卡在 `processing` 的事件重新排队；出站请求携带 `X-Event-Id` / `X-Idempotency-Key`，投递语义为 at-least-once。
@@ -42,9 +45,10 @@ docker compose up --build
 | OpenAPI Schema | <http://localhost:8000/openapi.json> |
 
 宿主机端口 `8000`，容器内端口 `8000`（在 `docker-compose.yml` 的 `ports` 中可改）。
-数据（事件、投递尝试、死信与重放记录、熔断器状态、目标暂停开关）持久化在命名卷
-`webhook-data`（容器内 `/data/webhooks.db`）；老版本数据库启动时会自动补齐重放、
-时间窗相关列以及熔断器表、目标暂停表，无需手工迁移。
+数据（事件、投递尝试、死信与重放记录、熔断器状态、目标暂停开关、目标限速配置与
+上次领取时刻）持久化在命名卷 `webhook-data`（容器内 `/data/webhooks.db`）；老版本
+数据库启动时会自动补齐重放、时间窗相关列以及熔断器表、目标暂停表、目标限速表，
+无需手工迁移。
 
 生产环境请覆盖默认密钥：
 
@@ -136,8 +140,9 @@ X-Webhook-Signature: sha256=<HMAC_SHA256(secret, 原始请求体) 的十六进�
 - `GET /events/{event_id}` — 查询单个事件，含全部投递尝试
 - `GET /events/key/{idempotency_key}` — 按幂等键查询
 - `GET /events?status=dead&limit=50&offset=0` — 列表，可按状态过滤（`queued` / `processing` / `delivered` / `dead` / `expired`）
-- `GET /targets/breakers?state=open&target=<url>&limit=200&offset=0` — 查询各目标端点的熔断器（见下节）
+- `GET /targets/breakers?state=open&target=<url>&limit=200&offset=0` — 查询各目标端点的熔断器（见第 5 节）
 - `GET /targets/pauses?target=<url>&paused=true` — 查询各目标端点的维护开关（见第 6 节）
+- `GET /targets/paces?target=<url>` — 查询各目标端点的限速配置（见第 7 节）
 
 响应示例（4 次尝试后进入死信）：
 
@@ -307,6 +312,89 @@ X-Webhook-Signature: sha256=<HMAC_SHA256(secret, 原始请求体) 的十六进�
 }
 ```
 
+### 7. 目标投递限速
+
+为单个目标端点限制投递频率：同一目标**两次领取之间至少间隔 `interval_seconds` 秒**。
+配置与上次领取时刻持久化在 SQLite `target_paces` 表，重启后保留；老数据库启动时
+`CREATE TABLE IF NOT EXISTS` 自动建表，无需手工迁移。
+
+#### `PUT /targets/pace`
+
+请求体：
+
+```json
+{"target": "http://example.com/hooks", "interval_seconds": 5}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `target` | 必填，目标 URL（http/https）；按与 `POST /events` **相同的规则规范化**（scheme/host 小写、默认端口省略、路径归一），与事件库里保存的目标串精确匹配 |
+| `interval_seconds` | 必填，**0～3600** 的数字：同一目标两次领取的最小间隔（秒）；`0` 表示关闭限速 |
+
+响应 `200`：
+
+```json
+{
+  "target": "http://example.com/hooks",
+  "interval_seconds": 5,
+  "last_claim_at": "2026-09-27T12:27:13.160640+00:00",
+  "next_claim_at": "2026-09-27T12:27:18.160640+00:00",
+  "updated_at": "2026-09-27T12:27:10.000000+00:00"
+}
+```
+
+- 重复设置相同间隔是**幂等**的：行内容（含 `updated_at`）不变；只有改值才刷新 `updated_at`。
+- **调整间隔保留上次领取时刻**：下一可领取时刻 = 上次领取时刻 + 新间隔，提交后立即按新间隔重算。
+- 设为 `0` **立即解除**限速（行与上次领取时刻都保留，再次启用时仍按它重算）。
+- 字段缺失/类型不对、间隔超出 0～3600、目标不是合法 URL → `422`。该接口不需要签名（运维管理面）。
+
+限速语义：
+
+1. **每次领取都占用间隔**：无论是事件首次投递、退避后的重试，还是熔断 half-open 探针，
+   只要某目标的事件被领取，就把该目标的「上次领取时刻」刷新为此次领取时刻，
+   下一次领取最早在「上次领取时刻 + 间隔」之后。
+2. **只阻挡队头**：限速只让该目标的队头事件等待（同目标后续事件本就按队头顺序排队），
+   **其他目标完全不受影响**，照常并行投递。
+3. **与既有规则叠加**：队头事件必须同时满足退避/`deliver_after` 到期、熔断器放行、
+   未暂停、限速间隔到期才会被领取——实际投递时刻取各条件中最晚者。
+4. **过期清扫不受限速影响**：排队事件到达 `expires_at` 仍照常转为 `expired`（零尝试）
+   并让位，不会因为限速而滞留队列。
+5. 设置（`PUT /targets/pace`）与调度器领取在同一把数据库锁保护的单条 SQLite 事务中
+   串行：已提交的间隔调整对下一个领取事务立即生效，先提交的领取不会被回滚。
+
+#### `GET /targets/paces`
+
+返回所有**显式设置过**限速的目标（从未设置的目标不出现在列表中，行为等同不限速）：
+
+| 参数 | 说明 |
+| --- | --- |
+| `target` | 可选，按规范化后的完整目标 URL 精确匹配 |
+| `limit` / `offset` | 可选，分页（`limit` 1–500，默认 200） |
+
+```json
+{
+  "paces": [
+    {
+      "target": "http://example.com/hooks",
+      "interval_seconds": 5,
+      "last_claim_at": "2026-09-27T12:27:13.160640+00:00",
+      "next_claim_at": "2026-09-27T12:27:18.160640+00:00",
+      "updated_at": "2026-09-27T12:27:10.000000+00:00"
+    }
+  ],
+  "limit": 200,
+  "offset": 0
+}
+```
+
+字段语义：
+
+- `interval_seconds`：当前生效的最小领取间隔；`0` 表示限速已关闭（行保留作记录）。
+- `last_claim_at`：该目标最近一次领取时刻（RFC 3339 UTC）；从未领取过为 `null`。
+- `next_claim_at`：按当前间隔算出的下一可领取时刻；限速关闭或从未领取时为 `null`，
+  过去的时间表示现在即可领取。
+- `updated_at`：最近一次修改配置的时刻。
+
 ### 出站投递格式
 
 服务向 `target` 发送 `POST`（`Content-Type: application/json`），请求体：
@@ -364,6 +452,14 @@ curl -s "$BASE/targets/pauses"                  # 查看所有已设置开关
 # 恢复：只解除暂停，退避/尝试次数/熔断状态全部保持原样
 curl -s -X PUT "$BASE/targets/pause" -H 'Content-Type: application/json' \
   -d "{\"target\":\"$BASE/dev/sink\",\"paused\":false}"
+
+# 目标限速：同一目标两次领取至少间隔 5 秒（无需签名），首次投递与重试都占用间隔
+curl -s -X PUT "$BASE/targets/pace" -H 'Content-Type: application/json' \
+  -d "{\"target\":\"$BASE/dev/sink\",\"interval_seconds\":5}"
+curl -s "$BASE/targets/paces"                   # 查看所有限速配置（含上次/下次可领取时刻）
+# 关闭限速：立即解除
+curl -s -X PUT "$BASE/targets/pace" -H 'Content-Type: application/json' \
+  -d "{\"target\":\"$BASE/dev/sink\",\"interval_seconds\":0}"
 ```
 
 Python 生成签名：
@@ -439,6 +535,19 @@ signature = "sha256=" + hmac.new(
 不触碰 `events` / `breakers` 的任何字段，因此队头顺序、`next_attempt_at`（退避与
 预约时间）、尝试计数与熔断状态全部保持，恢复后按原状态机继续。
 
+限速实现要点：`target_paces` 表（`target` 主键，`interval_seconds` 秒，
+`last_claim_ts` epoch 秒，`updated_at`）由 `init_db` 以 `CREATE TABLE IF NOT EXISTS`
+创建，老库启动即自动获得，配置与上次领取时刻持久化、重启保留。`PUT /targets/pace`
+复用与入站事件同一个 `HttpUrl` 规范化，重复设置相同间隔幂等（`updated_at` 不变）。
+领取事件的同一事务额外 `LEFT JOIN target_paces` 门控：无记录、`interval_seconds <= 0`、
+`last_claim_ts` 为空或 `last_claim_ts + interval_seconds <= now` 才放行；凡被领取的
+目标在**同一事务**里把 `last_claim_ts` 刷新为本次领取时刻——首次投递、退避重试、
+half-open 探针一视同仁，都占用一个间隔。调整间隔的 upsert **不触碰** `last_claim_ts`，
+因此下一可领取时刻立即按「上次领取时刻 + 新间隔」重算；设为 `0` 时门控恒通过，
+即立即解除。限速只挡住该目标的队头事件，其他目标的领取条件不变；领取事务开头的
+过期清扫不看限速，排队事件照常到期转 `expired`。限速写入与领取都在 `db_lock`
+保护的单条事务内，与暂停、熔断门控叠加在同一领取事务中生效。
+
 ## 运行测试
 
 ```bash
@@ -460,16 +569,20 @@ python -m pytest tests/ -v
 以及目标维护开关（URL 规范化精确匹配与重复设置幂等、暂停后不再领取而其他目标照常投递、
 在途请求正常完成、暂停/恢复不重置尝试计数与 1/2/4 退避、熔断 open 截止/计数/探针保持、
 暂停期间排队事件照常过期清扫、恢复后按原队头顺序投递、开关写入与领取在数据库事务中
-串行生效、老库自动建表且暂停状态跨重启保留）。
+串行生效、老库自动建表且暂停状态跨重启保留），
+以及按目标投递限速（URL 规范化与重复设置幂等、0～3600 区间校验、首次领取立即放行且
+后续领取按间隔放行、首次投递与重试都占用间隔、只阻挡该目标队头而其他目标照常投递、
+调小间隔按上次领取时刻重算下一可领取时刻、设为 0 立即解除、过期清扫不受限速影响、
+老库自动建表且配置与上次领取时刻跨重启保留）。
 
 ## 项目结构
 
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：签名校验、单事件/批量接收、查询、死信重放、熔断器查询、目标维护开关、dev sink
+│   ├── main.py        # FastAPI 路由：签名校验、单事件/批量接收、查询、死信重放、熔断器查询、目标维护开关、目标限速、dev sink
 │   ├── config.py      # 环境变量配置（含熔断阈值/open 时长）
-│   ├── db.py          # SQLite 表结构、状态机、有序 claim、熔断器状态机、目标暂停开关、批量事务写入、幂等查询
+│   ├── db.py          # SQLite 表结构、状态机、有序 claim、熔断器状态机、目标暂停开关、目标限速、批量事务写入、幂等查询
 │   ├── delivery.py    # 出站 HTTP 投递与 HMAC 签名
 │   └── worker.py      # 后台调度器（每端点有序、跨端点线程池并行）
 ├── tests/             # 端到端测试

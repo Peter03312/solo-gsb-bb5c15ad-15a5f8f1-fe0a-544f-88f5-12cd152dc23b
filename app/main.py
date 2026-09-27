@@ -36,6 +36,12 @@ class TargetPauseIn(BaseModel):
     paused: bool
 
 
+class TargetPaceIn(BaseModel):
+    target: HttpUrl
+    # Minimum seconds between two claims of this target; 0 disables pacing.
+    interval_seconds: float = Field(ge=0, le=3600)
+
+
 # In-memory counters for the built-in demo sink (not part of the core API).
 _sink_lock = threading.Lock()
 _sink_calls: dict[str, int] = {}
@@ -87,9 +93,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Reliable Webhook Delivery API",
-    version="1.5.0",
+    version="1.6.0",
     description="Sign, enqueue, reliably deliver, replay and inspect webhook events, "
-    "with persistent per-target circuit breakers and maintenance pauses.",
+    "with persistent per-target circuit breakers, maintenance pauses and "
+    "delivery pacing.",
     lifespan=lifespan,
 )
 
@@ -388,6 +395,55 @@ async def get_target_pauses(
         target=target, paused=paused, limit=limit, offset=offset
     )
     return {"pauses": rows, "limit": limit, "offset": offset}
+
+
+@app.put("/targets/pace")
+async def set_target_pace(pace_in: TargetPaceIn):
+    """Set the minimum interval between two deliveries to one target.
+
+    The request body is ``{"target": <url>, "interval_seconds": <0–3600>}``.
+    The target URL is normalised with exactly the same rule as event
+    ingestion (``str(HttpUrl)``), so it matches stored targets precisely.
+    ``interval_seconds`` is the minimum gap between two claims of the
+    target; ``0`` disables pacing. Setting the same value repeatedly is
+    idempotent — an identical request changes nothing but leaves
+    ``updated_at`` untouched.
+
+    Every claim of the target — first attempt, retry or half-open probe —
+    consumes one interval slot: the next head event of that target becomes
+    claimable only once ``last claim time + interval`` has elapsed. The
+    pace write and the scheduler's claim step are serialised through the
+    same database lock and run in single transactions, so a committed
+    change applies to the very next claim. Adjusting the interval keeps the
+    last-claim stamp, so the next claimable moment is recomputed from it;
+    setting ``0`` lifts the limit immediately. Pacing only ever holds back
+    that target's head event — other targets are delivered as usual — and
+    scheduling (``deliver_after``), backoff, breaker and pause rules keep
+    applying on top; the expiry sweep is not affected. Configuration and
+    the last-claim stamp persist in SQLite and survive restarts.
+    """
+    row = db.set_target_pace(str(pace_in.target), pace_in.interval_seconds)
+    return row
+
+
+@app.get("/targets/paces")
+async def get_target_paces(
+    target: str | None = Query(None, description="Filter by exact target URL."),
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """Report every target whose pacing has been configured.
+
+    Each row carries the exact (normalised) target URL, the current
+    ``interval_seconds`` (0 = pacing disabled), the ``last_claim_at``
+    moment of the most recent claim (RFC 3339 UTC, ``null`` if never
+    claimed), the resulting ``next_claim_at`` moment (``null`` while
+    disabled or never claimed; a past time means the target is claimable
+    now) and the last configuration change ``updated_at``. Targets that
+    were never configured do not appear and behave as unpaced.
+    """
+    rows = db.list_target_paces(target=target, limit=limit, offset=offset)
+    return {"paces": rows, "limit": limit, "offset": offset}
 
 
 @app.get("/health")

@@ -59,6 +59,23 @@ TERMINAL_STATUSES = ("delivered", "dead", "expired")
 #   databases by ``CREATE TABLE IF NOT EXISTS``.
 
 
+# Per-target delivery pacing:
+#   A row exists only for targets explicitly configured via PUT
+#   /targets/pace. ``interval_seconds`` is the minimum gap between two claims
+#   of the same target (0 disables pacing); ``last_claim_ts`` is the moment
+#   of the most recent claim — first attempt, retry and half-open probe
+#   alike, every claim consumes the slot. claim_due_events LEFT JOINs this
+#   table in its single claim transaction and skips heads whose
+#   ``last_claim_ts + interval_seconds`` is still in the future; the same
+#   transaction stamps ``last_claim_ts`` for every claimed target. Changing
+#   the interval keeps ``last_claim_ts``, so the next claimable moment is
+#   recomputed from the existing stamp; setting 0 lifts the limit at once.
+#   Pacing only ever holds back that target's head event — other targets
+#   are unaffected — and the expiry sweep ignores it. State lives only in
+#   SQLite, so it survives restarts and is initialised on old databases by
+#   ``CREATE TABLE IF NOT EXISTS``.
+
+
 class ReplayNotAllowedError(Exception):
     """Raised when a replay is requested for an event that is not dead."""
 
@@ -142,6 +159,13 @@ def init_db() -> None:
                 target     TEXT PRIMARY KEY,
                 paused     INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS target_paces (
+                target           TEXT PRIMARY KEY,
+                interval_seconds REAL NOT NULL DEFAULT 0,
+                last_claim_ts    REAL,
+                updated_at       TEXT NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_events_status
@@ -402,6 +426,17 @@ def claim_due_events() -> list[dict]:
        lock the pause write takes, so a committed pause is visible to the
        very next claim and a claim that committed first is never rolled
        back. The expiry sweep in step 1 deliberately ignores the pause.
+    5. A target with a pacing row (``target_paces``) gates step 2 the same
+       way: its head is claimable only when pacing is disabled
+       (``interval_seconds <= 0``), when the target was never claimed, or
+       when ``last_claim_ts + interval_seconds`` has elapsed. Every claim
+       stamps ``last_claim_ts`` in this same transaction — first attempts,
+       retries and half-open probes all consume the slot — so two claims of
+       one target are always spaced by the configured interval. Adjusting
+       the interval keeps the stamp, so the next claimable moment is
+       recomputed from it; setting 0 lifts the limit immediately. The gate
+       only ever holds back that target's head; other targets proceed
+       normally, and the expiry sweep in step 1 deliberately ignores pacing.
     """
     now = time.time()
     with db_lock:
@@ -417,6 +452,7 @@ def claim_due_events() -> list[dict]:
             SELECT e.* FROM events e
             LEFT JOIN breakers b ON b.target = e.target
             LEFT JOIN target_pauses p ON p.target = e.target
+            LEFT JOIN target_paces pc ON pc.target = e.target
             WHERE e.status = 'queued'
               AND e.next_attempt_at <= ?
               AND (p.target IS NULL OR p.paused = 0)
@@ -426,6 +462,12 @@ def claim_due_events() -> list[dict]:
                     OR (b.state = 'open' AND b.open_until_ts IS NOT NULL
                         AND b.open_until_ts <= ?)
               )
+              AND (
+                    pc.target IS NULL
+                    OR pc.interval_seconds <= 0
+                    OR pc.last_claim_ts IS NULL
+                    OR pc.last_claim_ts + pc.interval_seconds <= ?
+              )
               AND NOT EXISTS (
                     SELECT 1 FROM events e2
                     WHERE e2.target = e.target
@@ -434,7 +476,7 @@ def claim_due_events() -> list[dict]:
               )
             ORDER BY e.rowid
             """,
-            (now, now),
+            (now, now, now),
         ).fetchall()
         if rows:
             conn.executemany(
@@ -449,6 +491,13 @@ def claim_due_events() -> list[dict]:
                 "UPDATE breakers SET state = 'half-open', probe_event_id = ?, "
                 "open_until_ts = NULL WHERE target = ? AND state = 'open'",
                 [(r["id"], r["target"]) for r in rows],
+            )
+            # Every claim — first attempt, retry or half-open probe — stamps
+            # the target's pace slot, so the next event for it waits a full
+            # interval. Targets without a pace row simply match no row here.
+            conn.executemany(
+                "UPDATE target_paces SET last_claim_ts = ? WHERE target = ?",
+                [(now, r["target"]) for r in rows],
             )
         conn.commit()
         return [_hydrate(r) for r in rows]
@@ -804,3 +853,109 @@ def list_target_pauses(
             (*params, limit, offset),
         ).fetchall()
         return [_hydrate_pause(r) for r in rows]
+
+
+# ------------------------------------------------------------ target pacing
+
+def set_target_pace(target: str, interval_seconds: float) -> dict:
+    """Upsert one target's pacing interval in a single transaction.
+
+    The target string is matched exactly against the stored events' target
+    column (callers normalise the URL with the same rule used at ingest, so
+    the keys line up). ``interval_seconds`` is the minimum gap between two
+    claims of the target; 0 disables pacing. Setting the same value
+    repeatedly is idempotent: an already-correct row is returned untouched
+    and ``updated_at`` does not move.
+
+    The upsert never touches ``last_claim_ts``: adjusting the interval
+    recomputes the next claimable moment from the existing last-claim stamp,
+    and disabling keeps the stamp so re-enabling later still counts from the
+    last actual claim. The write takes ``db_lock`` — the very same lock and
+    serialisation point as ``claim_due_events`` — so once the commit
+    returns, every later claim transaction applies the new interval (or its
+    absence) immediately.
+    """
+    with db_lock:
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT * FROM target_paces WHERE target = ?", (target,)
+        ).fetchone()
+        if row is not None and row["interval_seconds"] == interval_seconds:
+            return _hydrate_pace(row)
+        conn.execute(
+            "INSERT INTO target_paces "
+            "(target, interval_seconds, last_claim_ts, updated_at) "
+            "VALUES (?, ?, NULL, ?) "
+            "ON CONFLICT(target) DO UPDATE SET "
+            "interval_seconds = excluded.interval_seconds, "
+            "updated_at = excluded.updated_at",
+            (target, interval_seconds, _iso()),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM target_paces WHERE target = ?", (target,)
+        ).fetchone()
+        return _hydrate_pace(row)
+
+
+def _hydrate_pace(row: sqlite3.Row) -> dict:
+    """Public pace representation with UTC ISO timestamps.
+
+    ``next_claim_at`` is the moment the target becomes claimable again
+    (``last_claim + interval``); it is ``None`` while pacing is disabled or
+    the target was never claimed, and may lie in the past, which simply
+    means the target is claimable right now.
+    """
+    interval = row["interval_seconds"]
+    last_claim_ts = row["last_claim_ts"]
+    next_claim_ts = (
+        last_claim_ts + interval
+        if last_claim_ts is not None and interval > 0
+        else None
+    )
+    return {
+        "target": row["target"],
+        "interval_seconds": (
+            int(interval) if float(interval).is_integer() else interval
+        ),
+        "last_claim_at": (
+            datetime.fromtimestamp(last_claim_ts, tz=timezone.utc)
+            .isoformat(timespec="microseconds")
+            if last_claim_ts is not None
+            else None
+        ),
+        "next_claim_at": (
+            datetime.fromtimestamp(next_claim_ts, tz=timezone.utc)
+            .isoformat(timespec="microseconds")
+            if next_claim_ts is not None
+            else None
+        ),
+        "updated_at": row["updated_at"],
+    }
+
+
+def list_target_paces(
+    target: str | None = None,
+    limit: int = 200, offset: int = 0,
+) -> list[dict]:
+    """Return configured pacing rows, optionally filtered by exact target.
+
+    Only targets ever set through ``PUT /targets/pace`` appear (a target
+    without a row behaves as unpaced). Rows with ``interval_seconds = 0``
+    are kept — they are the visible record of a disabled limit.
+    """
+    limit = max(1, min(limit, 500))
+    clauses: list[str] = []
+    params: list = []
+    if target is not None:
+        clauses.append("target = ?")
+        params.append(target)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    with db_lock:
+        conn = get_conn()
+        rows = conn.execute(
+            f"SELECT * FROM target_paces {where} ORDER BY target "
+            "LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        ).fetchall()
+        return [_hydrate_pace(r) for r in rows]
