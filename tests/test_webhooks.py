@@ -111,8 +111,12 @@ def test_event_is_delivered_and_queryable(server):
     assert mine[0]["idempotency_key"] == event["idempotency_key"]
     assert mine[0]["signature"] == _sign(mine[0]["body"].encode())
 
-    # List endpoint shows it too.
-    listed = httpx.get(f"{server.base_url}/events", params={"status": "delivered"}).json()
+    # List endpoint shows it too. A high limit keeps this independent of how
+    # many events earlier tests of the shared session accumulated.
+    listed = httpx.get(
+        f"{server.base_url}/events",
+        params={"status": "delivered", "limit": 200},
+    ).json()
     assert any(e["id"] == event["id"] for e in listed["events"])
 
 
@@ -158,8 +162,10 @@ def test_retries_use_1_2_4_backoff_then_dead_letter(server):
     assert 1.8 <= gaps[1] <= 3.5, gaps
     assert 3.6 <= gaps[2] <= 5.5, gaps
 
-    # Dead-letter events are listed under status=dead.
-    dead = httpx.get(f"{server.base_url}/events", params={"status": "dead"}).json()
+    # Dead-letter events are listed under status=dead (large page: shared DB).
+    dead = httpx.get(
+        f"{server.base_url}/events", params={"status": "dead", "limit": 200}
+    ).json()
     assert any(e["id"] == event_id for e in dead["events"])
 
 
@@ -302,9 +308,11 @@ def test_replay_dead_event_requeues_and_delivers_with_full_history(server):
     assert mine[-1]["idempotency_key"] == dead["idempotency_key"]
     assert mine[-1]["signature"] == _sign(mine[-1]["body"].encode())
 
-    # List responses expose the replay metadata too.
+    # List responses expose the replay metadata too. A high limit keeps this
+    # independent of the number of events earlier tests accumulated.
     listed = httpx.get(
-        f"{server.base_url}/events", params={"status": "delivered"}
+        f"{server.base_url}/events",
+        params={"status": "delivered", "limit": 200},
     ).json()
     entry = [e for e in listed["events"] if e["id"] == event_id]
     assert entry and entry[0]["replay_count"] == 1
@@ -442,7 +450,11 @@ def test_window_fields_default_and_roundtrip(server):
         f"{server.base_url}/events/key/{event['idempotency_key']}"
     ).json()
     assert by_key["deliver_after"] == event["deliver_after"]
-    listed = httpx.get(f"{server.base_url}/events").json()
+    # A high limit keeps this independent of events accumulated by earlier
+    # tests of the shared session (default page size is 50).
+    listed = httpx.get(
+        f"{server.base_url}/events", params={"limit": 200}
+    ).json()
     entry = [e for e in listed["events"] if e["id"] == event["id"]]
     assert entry and entry[0]["deliver_after"] == event["deliver_after"]
 
@@ -639,7 +651,7 @@ def test_queued_event_expires_without_attempt_and_unblocks_next(server):
 
     # The expired status is filterable and carries the window fields.
     listed = httpx.get(
-        f"{server.base_url}/events", params={"status": "expired"}
+        f"{server.base_url}/events", params={"status": "expired", "limit": 200}
     ).json()
     entry = [e for e in listed["events"] if e["id"] == second_id]
     assert entry and entry[0]["expires_at"] is not None

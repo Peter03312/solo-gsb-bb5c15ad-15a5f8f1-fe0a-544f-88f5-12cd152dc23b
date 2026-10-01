@@ -59,6 +59,26 @@ TERMINAL_STATUSES = ("delivered", "dead", "expired")
 #   databases by ``CREATE TABLE IF NOT EXISTS``.
 
 
+# Per-target delivery pace (rate limit):
+#   A row exists only for targets explicitly configured via PUT
+#   /targets/pace. ``interval_seconds > 0`` gates scheduling in the same
+#   claim transaction as everything else: the due head event is claimable
+#   only once ``last_claim_ts + interval_seconds`` has passed, where
+#   ``last_claim_ts`` is stamped at every claim (first delivery *and* every
+#   retry claim). ``interval_seconds = 0`` disables the gate immediately.
+#   Changing the interval does not touch ``last_claim_ts`` — the next
+#   claimable moment is recomputed from the last claim. The gate only holds
+#   back that target's own head event (other targets claim independently)
+#   and is stacked on top of the deliver_after/backoff, breaker and pause
+#   gates; the expiry sweep deliberately ignores it. Like pauses, the
+#   configuration and the last-claim stamp persist in SQLite across
+#   restarts and the table is auto-created on old databases. Claims also
+#   stamp *implicit* rows (``configured = 0``, interval 0) for targets
+#   never explicitly configured; they stay invisible to the listing and a
+#   later ``PUT`` adopts their stamp, so configuring a pace right after a
+#   claim cannot smuggle a second delivery through.
+
+
 class ReplayNotAllowedError(Exception):
     """Raised when a replay is requested for an event that is not dead."""
 
@@ -144,6 +164,14 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS target_paces (
+                target           TEXT PRIMARY KEY,
+                interval_seconds REAL NOT NULL DEFAULT 0,
+                configured       INTEGER NOT NULL DEFAULT 0,
+                last_claim_ts    REAL,
+                updated_at       TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_events_status
                 ON events(status, next_attempt_at);
             CREATE INDEX IF NOT EXISTS idx_events_target ON events(target);
@@ -151,7 +179,23 @@ def init_db() -> None:
             """
         )
         _migrate_events(conn)
+        _migrate_target_paces(conn)
         conn.commit()
+
+
+def _migrate_target_paces(conn: sqlite3.Connection) -> None:
+    """Backfill the ``configured`` flag on databases created earlier.
+
+    Databases from the first pace revision got the ``target_paces`` table
+    without the ``configured`` column that distinguishes explicit PUT rows
+    from implicit claim stamps; ``CREATE TABLE IF NOT EXISTS`` never alters
+    it. Existing rows were always explicit PUT rows, hence the default 1.
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(target_paces)")}
+    if cols and "configured" not in cols:
+        conn.execute(
+            "ALTER TABLE target_paces ADD COLUMN configured INTEGER NOT NULL DEFAULT 1"
+        )
 
 
 def _migrate_events(conn: sqlite3.Connection) -> None:
@@ -402,6 +446,19 @@ def claim_due_events() -> list[dict]:
        lock the pause write takes, so a committed pause is visible to the
        very next claim and a claim that committed first is never rolled
        back. The expiry sweep in step 1 deliberately ignores the pause.
+    5. A target with a configured delivery pace
+       (``target_paces.interval_seconds > 0``) gates step 2 as well: the due
+       head event is claimable only when ``last_claim_ts`` is NULL (first
+       delivery) or ``last_claim_ts + interval_seconds`` has elapsed.
+       Every claim in step 2 stamps ``last_claim_ts`` in this same
+       transaction, so first deliveries and retry claims alike consume an
+       interval and the gate holds across restarts. The stamp and the pace
+       write share ``db_lock`` and single transactions, so a committed
+       interval change takes effect on the very next claim, recomputed from
+       the unchanged last-claim moment; an interval of 0 disables the gate
+       immediately. Only that target's own head event is held back — other
+       targets still claim — and the expiry sweep in step 1 ignores the
+       pace, so queued events expire on their deadline regardless.
     """
     now = time.time()
     with db_lock:
@@ -417,9 +474,16 @@ def claim_due_events() -> list[dict]:
             SELECT e.* FROM events e
             LEFT JOIN breakers b ON b.target = e.target
             LEFT JOIN target_pauses p ON p.target = e.target
+            LEFT JOIN target_paces pc ON pc.target = e.target
             WHERE e.status = 'queued'
               AND e.next_attempt_at <= ?
               AND (p.target IS NULL OR p.paused = 0)
+              AND (
+                    pc.target IS NULL
+                    OR pc.interval_seconds = 0
+                    OR pc.last_claim_ts IS NULL
+                    OR pc.last_claim_ts + pc.interval_seconds <= ?
+              )
               AND (
                     b.target IS NULL
                     OR b.state = 'closed'
@@ -434,7 +498,7 @@ def claim_due_events() -> list[dict]:
               )
             ORDER BY e.rowid
             """,
-            (now, now),
+            (now, now, now),
         ).fetchall()
         if rows:
             conn.executemany(
@@ -449,6 +513,27 @@ def claim_due_events() -> list[dict]:
                 "UPDATE breakers SET state = 'half-open', probe_event_id = ?, "
                 "open_until_ts = NULL WHERE target = ? AND state = 'open'",
                 [(r["id"], r["target"]) for r in rows],
+            )
+            # Every claim — first delivery and every retry — consumes a pace
+            # interval by stamping the target's last-claim time in this same
+            # transaction. The upsert also records implicit rows (interval 0,
+            # unconfigured) for targets that have never been configured: if a
+            # pace is committed afterwards, it keeps this stamp, so a claim
+            # that serialised ahead of the pace write is still the target's
+            # last claim. Rows with interval 0 keep stamping too, so
+            # re-enabling the pace later recomputes from the true last claim.
+            # Head ordering makes each claimed target unique; DISTINCT only
+            # guards against duplicated input.
+            # INSERT carries interval 0 / configured 0 for new implicit rows;
+            # on conflict the UPDATE names only last_claim_ts, so an existing
+            # explicit configuration (its own interval/configured columns) is
+            # never touched.
+            conn.executemany(
+                "INSERT INTO target_paces (target, interval_seconds, configured, "
+                "last_claim_ts, updated_at) VALUES (?, 0, 0, ?, '') "
+                "ON CONFLICT(target) DO UPDATE SET last_claim_ts = "
+                "excluded.last_claim_ts",
+                [(target, now) for target in {r["target"] for r in rows}],
             )
         conn.commit()
         return [_hydrate(r) for r in rows]
@@ -804,3 +889,107 @@ def list_target_pauses(
             (*params, limit, offset),
         ).fetchall()
         return [_hydrate_pause(r) for r in rows]
+
+
+# ------------------------------------------------------------- target paces
+
+def set_target_pace(target: str, interval_seconds: float) -> dict:
+    """Upsert one target's delivery interval in a single transaction.
+
+    The target string is matched exactly against the stored events' target
+    column (callers normalise the URL with the same rule used at ingest, so
+    the keys line up). ``interval_seconds`` of 0 disables the pace. Setting
+    the same interval repeatedly is idempotent: an already-correct row is
+    returned untouched, ``updated_at`` does not move and the persisted
+    ``last_claim_ts`` is never reset. Changing to a different interval also
+    leaves ``last_claim_ts`` alone — the next claimable moment is recomputed
+    by the claim gate as ``last_claim_ts + interval_seconds``. The write
+    takes ``db_lock`` — the very same lock and serialisation point as
+    ``claim_due_events`` — so once the commit returns, the next claim
+    transaction immediately applies the new interval (and an interval of 0
+    lifts the gate at once), while a claim that committed first keeps its
+    ``processing`` event and its last-claim stamp.
+    """
+    with db_lock:
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT * FROM target_paces WHERE target = ? AND configured = 1",
+            (target,),
+        ).fetchone()
+        if row is not None and float(row["interval_seconds"]) == float(interval_seconds):
+            return _hydrate_pace(row)
+        # On an implicit (stamp-only) row created by a claim that ran before
+        # any configuration, the upsert adopts its last_claim_ts instead of
+        # resetting it: that claim genuinely was the target's last claim.
+        conn.execute(
+            "INSERT INTO target_paces (target, interval_seconds, configured, "
+            "last_claim_ts, updated_at) VALUES (?, ?, 1, NULL, ?) "
+            "ON CONFLICT(target) DO UPDATE SET interval_seconds = "
+            "excluded.interval_seconds, configured = 1, "
+            "updated_at = excluded.updated_at",
+            (target, float(interval_seconds), _iso()),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM target_paces WHERE target = ?", (target,)
+        ).fetchone()
+        return _hydrate_pace(row)
+
+
+def _hydrate_pace(row: sqlite3.Row) -> dict:
+    """Public pace representation with ISO UTC timestamps."""
+    interval = float(row["interval_seconds"])
+    last_claim_ts = row["last_claim_ts"]
+    # Echo integer-valued intervals as integers, matching JSON requests such
+    # as ``5``; fractional intervals keep their float form.
+    interval_out = int(interval) if interval.is_integer() else interval
+    last_claimed_at = (
+        datetime.fromtimestamp(last_claim_ts, tz=timezone.utc)
+        .isoformat(timespec="microseconds")
+        if last_claim_ts is not None
+        else None
+    )
+    next_claimable_at = None
+    if interval > 0 and last_claim_ts is not None:
+        next_claimable_at = (
+            datetime.fromtimestamp(last_claim_ts + interval, tz=timezone.utc)
+            .isoformat(timespec="microseconds")
+        )
+    return {
+        "target": row["target"],
+        "interval_seconds": interval_out,
+        "last_claimed_at": last_claimed_at,
+        "next_claimable_at": next_claimable_at,
+        "updated_at": row["updated_at"],
+    }
+
+
+def list_target_paces(
+    target: str | None = None,
+    active: bool | None = None,
+    limit: int = 200, offset: int = 0,
+) -> list[dict]:
+    """Return configured pace rows, optionally filtered.
+
+    Only targets ever set through ``PUT /targets/pace`` appear (a row
+    without an explicit setting does not exist and behaves as unpaced).
+    ``active=True`` returns rows with a positive interval; ``active=False``
+    returns explicitly disabled (interval 0) rows.
+    """
+    limit = max(1, min(limit, 500))
+    clauses: list[str] = ["configured = 1"]
+    params: list = []
+    if target is not None:
+        clauses.append("target = ?")
+        params.append(target)
+    if active is not None:
+        clauses.append("interval_seconds > 0" if active else "interval_seconds = 0")
+    where = "WHERE " + " AND ".join(clauses)
+    with db_lock:
+        conn = get_conn()
+        rows = conn.execute(
+            f"SELECT * FROM target_paces {where} ORDER BY target "
+            "LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        ).fetchall()
+        return [_hydrate_pace(r) for r in rows]
